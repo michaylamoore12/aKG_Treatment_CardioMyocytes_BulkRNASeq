@@ -1,0 +1,1311 @@
+---
+title: "RNA-Seq Analysis"
+author: "Michayla Moore"
+date: "2024-08-09"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, message=FALSE, warning=FALSE}
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+ # install.packages("BiocManager")
+ # install.packages("tidyverse")
+ # install.packages("gplots")
+#BiocManager::install("edgeR")
+#BiocManager::install("tximport")
+#BiocManager::install("tximportData")
+#BiocManager::install("readr")
+#BiocManager::install("GenomicFeatures")
+#BiocManager::install("txdbmaker")
+#BiocManager::install("org.Mm.eg.db")
+#BiocManager::install("pander")
+
+library(tximport)
+library(readr)
+library(GenomicFeatures)
+library(dplyr)
+library(org.Mm.eg.db)
+library(biomaRt)
+library(org.Hs.eg.db) 
+library(edgeR)
+library(pander)
+library(tidyverse)
+library(gplots)
+library(ggridges)
+library(ggplot2)
+library(enrichplot)
+library(clusterProfiler)
+library(tidyr)
+```
+
+# Make .RDS tximport file
+```{r, include=FALSE}
+# Navigate to salmon raw data folder
+getwd()
+# setwd("C:/Users/micha/OneDrive/Desktop/aKG_CM_RNA-seq/RNASeq_PreProcess_aKG_CM/salmon")
+```
+
+```{r}
+# Example: List of file paths to quant.sf files
+files <- c("SRR29804826/quant.sf", "SRR29804827/quant.sf", "SRR29804828/quant.sf",
+           "SRR29804829/quant.sf", "SRR29804830/quant.sf", "SRR29804831/quant.sf")
+names(files) <- c("SRR29804826", "SRR29804827", "SRR29804828",
+                  "SRR29804829", "SRR29804830", "SRR29804831")
+
+list(files)
+```
+
+```{r, warning=FALSE}
+# Navigate to tx2gene file GRCm39.104
+# setwd("C:/Users/micha/OneDrive/Desktop/GTF_File")
+tx2gene_mouse_GRCm39.104 <- read.csv("tx2gene_mouse_GRCm39.104.csv")
+head(tx2gene_mouse_GRCm39.104)
+
+# This is important because tximport expects the input for the tx2gene argument to be a two-column data # # frame where the first column contains transcript IDs and the second column contains gene IDs.
+tx2gene_mouse_GRCm39.104 <- tx2gene_mouse_GRCm39.104[, c("TXNAME", "GENEID")]
+head(tx2gene_mouse_GRCm39.104)
+```
+
+```{r, warning=FALSE, include=FALSE}
+# Navigate to salmon raw data folder
+setwd("C:/Users/micha/OneDrive/Desktop/aKG_CM_RNA-seq/RNASeq_PreProcess_aKG_CM/salmon")
+txi <- tximport(files, type = "salmon", tx2gene = tx2gene_mouse_GRCm39.104, 
+                ignoreTxVersion = TRUE)
+
+# Inspect and save
+head(txi)
+txi_df <- as.data.frame(txi)
+write.csv(txi,file = "tximport_results.csv",row.names = TRUE)
+saveRDS(txi, file = "tximport_results.RDS")
+```
+
+# ID Conversion 
+```{r, include=FALSE}
+# Use org.eg.db package to create an annotation table which has "ENTREZID","SYMBOL","GENENAME" # information of all Ensembl gene IDs used in tximport output.
+library(AnnotationDbi)
+
+# Extract txi counts only
+txi_list <- row.names(txi$counts)
+# head(txi_list)
+
+# Extract ENSEMBL ID and map to others (mouse)
+rosetta_txi <- AnnotationDbi::select(org.Mm.eg.db, keys=txi_list, keytype="ENSEMBL", columns=c("ENTREZID","SYMBOL","GENENAME", "UNIPROT"))
+
+# REMOVE DUPLICATES
+# Examine duplicates 
+sum(duplicated(rosetta_txi$ENSEMBL)) # of rows with duplicated ENSEMBL IDs
+
+# pull out those rows with duplicated ENSEMBL IDs
+rosetta_txi[duplicated(rosetta_txi$ENSEMBL),]
+
+# remove rows with duplicated ENSEMBL IDs and create an unique annotation table
+rosetta_txi_output_remove_dup <-rosetta_txi[-c(which(duplicated(rosetta_txi$ENSEMBL)==TRUE)),]
+
+# check
+sum(duplicated(rosetta_txi_output_remove_dup$ENSEMBL))
+```
+
+```{r}
+# Sanity check
+head(rosetta_txi_output_remove_dup, 5)
+```
+
+```{r, include=FALSE}
+# txi results and ID alignment
+
+# align txi and rosetta
+length(txi_list)
+dim(rosetta_txi_output_remove_dup) 
+
+# rearrange rows so that the order of ENSEMBL IDs in annotation table matches the IDs in RNAseq results 
+matched.rosetta_txi_output_remove_dup<-rosetta_txi_output_remove_dup[match(rosetta_txi_output_remove_dup$ENSEMBL,txi_list),]
+dim(matched.rosetta_txi_output_remove_dup)
+identical(txi_list,matched.rosetta_txi_output_remove_dup$ENSEMBL)
+
+# export the annotation table as a csv file for later use in edgeR module.
+write.csv(matched.rosetta_txi_output_remove_dup,file = "AnnotTable.csv",row.names = FALSE)
+```
+
+```{r}
+# Sanity check
+head(matched.rosetta_txi_output_remove_dup,5)
+```
+
+# Exploratory Analysis
+## Performing EDA on tximport results helps to ensure data quality and prepares the dataset for more reliable differential expression analysis. This step is integral to identifying and addressing potential issues that could affect downstream results.
+```{r}
+# Load raw txi results
+txi <- readRDS("tximport_results.RDS")
+txi_counts <- txi$counts
+
+# Load in sample metadata
+metadata <- read.csv(file = "metadata.csv",
+                     header = TRUE, 
+                     row.names = 1)
+
+head(txi_counts, 5)
+head(metadata, 5)
+```
+
+```{r}
+# CHANGE AS NEEDED
+# In order to make sure each sample is annotated with the correct information, 
+# we need to define our groups/treatments and set these as factors.
+# Donor <- factor(metadata$Donor)
+# Arsenic <- factor(metadata$Arsenic)
+
+# To have untreated as reference you need to put levels argument
+# The FIRST level listed is treated as the reference group (order matters)
+treatment <- factor(metadata$treatment, levels = c("PBS injection", "alpha-KG injection"))
+
+groups <- data.frame(Sample = rownames(metadata), treatment)
+
+# Check it out to make sure everything is in the same order as your samples
+cbind(groups, colnames(txi_counts)) # Looks good!
+
+# Let's rename the counts columns to something more informative
+groups$ColNames <- paste(groups$treatment, 
+                         sep = "_")
+colnames(txi_counts) <- groups$ColNames
+colnames(txi_counts)
+```
+
+```{r}
+# Let's take a look at our data!
+head(txi_counts)
+```
+
+```{r}
+# How many genes and samples do we have?
+dim(txi_counts) # of genes and # of samples
+```
+
+# Looking at technical variation of raw data
+```{r}
+# Let's start looking at technical variation within our data
+# Total counts per sample (library size)
+
+# Adjust the margins to make room for x-axis labels
+par(mar = c(8, 4, 4, 2))  # Increase the bottom margin to fit labels
+
+# Create the bar plot
+barplot(colSums(txi_counts), 
+        las = 2,  # Rotate x-axis labels to be vertical
+        col = "lightsteelblue2",
+        cex.names = 0.7)  # Adjust the size of the x-axis labels
+```
+
+
+```{r}
+# Are there any systematic differences in total counts by treatment? 
+# Treatment
+boxplot(colSums(txi_counts) ~ treatment, 
+        col=c("grey","lightsteelblue2"),
+        ylab="Counts (Sum)",
+        xlab="Treatment")
+
+# Perform statistical analysis
+t.test(colSums(txi_counts) ~ treatment)
+```
+
+# Normality of data
+```{r}
+# Many stats tests assume a normal distribution of data. Do our raw counts look 
+# normally distributed?
+
+# Count distribution
+# 0 values are an issue, need to exclude low abundance genes
+hist(log2(rowSums(txi_counts)), col="grey",
+     main="Expressed Genes",
+     xlab="Counts (raw)")
+
+# Let's see if we can fix up that distribution.
+# Excluding low abundance genes
+MinVals <- apply(txi_counts, 1, min) # Find the minimum value in each row
+
+# How many genes have 0 counts?
+sum(MinVals == 0) # of genes. Holy moley, that's a lot that we don't want.
+Exp <- txi_counts[MinVals > 0, ] # Remove rows (transcripts) with zero counts
+```
+
+```{r}
+# Now that zeros are removed
+# The most common way to begin to process your data is through log2 transformation.
+# This will give our counts data the normal distribution that our subsequent
+# gene expression analysis will expect
+
+# Log2 transformation
+ExpLog2 <- log2(Exp)
+hist(rowMeans(ExpLog2), xlab = "Counts (log2)", main = "Expressed Genes",
+     sub = "Removed Zeros",
+     col="lightsteelblue2")
+```
+
+```{r}
+# That's looking a lot better!
+# Now let's take a look at these counts across our samples
+
+# Plot "raw" (our log2 transformed) sample counts
+boxplot(ExpLog2, ylab = "log2 counts", main = "Raw RNA-Seq Counts", las = 2)
+
+# With this "uneven" distribution of counts, how do our samples cluster?
+# Are there any outliers before normalization?
+
+# Dist calculates distances between rows, use t() to transpose
+RawDist <- dist(t(ExpLog2), method = "euclidean")
+plot(hclust(RawDist, method = "average"), xlab="Sample")
+
+# Although most like samples are clustering together,
+# we can see some samples not clustering by treatment.
+# So, we will need to normalize our data!
+```
+
+# Simple Normalization (Correction Factor)
+```{r}
+# Simple normalization
+SampleMedians <- apply(ExpLog2, 2, median) # Find the median value of each column
+GrandMedian <- mean(SampleMedians) # Take the average of those
+CorrectionFactors <- GrandMedian - SampleMedians # Calculate correction factor to apply to data
+CorrectionFactors
+
+# These correction factors will align the medians of all of our samples
+# This changes our counts just enough to correct for variability between
+# samples/groups without loosing any actual effects of changes in gene expression.
+
+# Loop through each column (sample) and fill in medians adjusted with 
+# sample correction factor
+
+ExpNorm <- ExpLog2
+
+for(col in colnames(ExpNorm)){
+  ExpNorm[, col] <- ExpLog2[, col] + CorrectionFactors[col]
+}
+```
+
+```{r}
+# Visualize normalized data
+# We want to see the medians all in a straight line
+
+# Boxplot of normalized counts
+boxplot(ExpNorm, ylab = "log2 counts", main = "Normalized Counts", las = 2, col="lightsteelblue2")
+
+# And do our treatments cluster together better now?
+# Cluster dendrogram of normalized data
+NormDist <- dist(t(ExpNorm), method = "euclidean")
+plot(hclust(NormDist, method = "average"), xlab="Sample")
+# Yes, yes they do
+```
+
+```{r}
+# PCA Plot
+PCA <- prcomp(t(NormDist))
+plot(PCA$x[ , 1], PCA$x[ , 2], pch = 16)
+
+# But that doesn't tell you too much, does it?
+# You can color the PCA plot by factor to visualize what specific samples
+# may be outliers/driving variation in your data
+```
+
+```{r}
+# By donor
+#plot(PCA$x[ , 1], PCA$x[ , 2], pch = 16, col = Donor, 
+ #    main = "Colored by Donor")
+# You can even add a legend if you'd like
+#legend("topleft", legend = unique(Donor), pch = 16, col = unique(Donor))
+
+# By treatment
+plot(PCA$x[ , 1], PCA$x[ , 2], pch = 16, cex = 1.5, col = treatment, 
+     main = "PCA",
+     ylab="PC2",
+     xlab="PC1")
+legend("topright", legend = unique(treatment), pch = 16, cex = 1.5, col = unique(treatment))
+```
+
+```{r}
+# Take home message:
+
+# Always perform an exploratory analysis before your differential gene 
+# expression analysis!
+# This helps you to:
+# 1. Make sure your experiment worked
+# 2. Find sources of variation within your data
+# 3. Find samples that may be outliers in your data
+# 4. Visualize your raw data before normalization and your normalized
+#    data before you perform differential expression analysis or any 
+#    statistical tests
+```
+
+# edgeR
+```{r, warning=FALSE}
+# We'll start by creating a DGE object using our counts file
+# We will set the "counts =" to our counts dataframe, remove any rows with zero 
+# counts, and set our gene names are the row names in our counts table. 
+# You can set the genes argument to an annotation table that contains multiple 
+# gene identifiers as well (ENSEMBL, ENTREZ, etc.)
+
+DGE <- DGEList(counts = txi_counts, remove.zeros = TRUE, genes = rownames(txi_counts))
+DGE_df <- as.data.frame(DGE)
+head(DGE_df)
+```
+
+```{r}
+# CHANGE AS NEEDED
+# Create design matrix
+# This will inform our DGE object of which samples will be reference conditions
+# for each factor we are interested in
+design <- model.matrix(~ 0 + treatment)
+rownames(design) <- colnames(DGE)
+design
+```
+
+```{r, include=FALSE}
+# Since we already removed zeros, we can now remove low expressed genes
+# Remove low expression genes 
+keep <- filterByExpr(DGE, design, min.count = 10, min.total.count = 15)
+DGE <- DGE[keep, ] # Keep genes that meet our threshold!
+
+head(DGE)
+DGE_remove_zeros_check <- as.data.frame(DGE)
+```
+
+```{r}
+# Sanity check removed low counts
+head(DGE_remove_zeros_check, 10)
+```
+
+
+```{r, include=FALSE}
+# Looking at library sizes
+
+# Take a look at the library sizes of each sample
+# Are there any differences in library size?
+# We'll fix that in a minute by normalizing
+DGE$samples
+```
+
+# Normalize DGE (TMM)
+```{r}
+# Normalize library sizes
+
+# So, instead of using the total library size, 
+# which is the sum of the reads to all of the genes, we will use TMM normalization.
+# Trimmed mean of M-values, where M-values are the log fold change between each 
+# sample and a reference.
+# TMM trims off the most highly variable genes and then calculates a normalization 
+# factor that is used to adjust the library size
+
+# Normalize for different library sizes (TMM, trimmed mean of M-values)
+DGE <- calcNormFactors(DGE) # Calculates normalization factors and adds them to our DGE object
+DGE$samples
+```
+
+```{r}
+# Now on to dispersion
+
+# Dispersion means biological coeffient of variation (BCV) squared (BCV^2).
+# This is a measure of variability
+# Ex: If gene expression typically differs from replicate to replicate by 20% 
+# its BCV is 0.2, and its dispersion is 0.04. 
+# Dispersion can also vary based on the biological model you are using. 
+# For example, human data could have a BCV of 0.4,
+# while genetically identical model organisms could be 0.1.
+
+# edgeR estimates dispersion from replicates using the quantile-adjusted 
+# conditional maximum likelihood method (qCML). The qCML method is designed to 
+# address composition bias, which occurs when the proportion of reads mapping 
+# to different genes varies across samples. This bias can arise due to factors 
+# such as differences in sequencing depths or varying transcript abundances. 
+
+# The qCML method uses 2 main types of dispersion:
+# Common dispersion calculates a common dispersion value for all genes, 
+# while the tagwise method calculates gene-specific dispersions. 
+
+# Calculate overall dispersion
+# estimateGLMCommonDisp calculates within-group and between-group variability. 
+DGE <- estimateGLMCommonDisp(DGE, design, verbose = TRUE) #Disp = 0.01293 , BCV = 0.1137 
+
+# For this data: Disp = 0.0971 , BCV = 0.3116.
+# So on average, the true abundance for each gene can vary up or down by ~31% 
+# between replicates
+
+# Calculate dispersion trend based on gene abundance
+DGE <- estimateGLMTrendedDisp(DGE, design) 
+
+# Calculate separate dispersion for each gene
+DGE <- estimateGLMTagwiseDisp(DGE, design) 
+
+
+# Visualize dispersion
+# counts per million, BCV = variation, each dot is a gene
+# more variation in beginning is better, so trend should look like this
+plotBCV(DGE)
+
+#Good Results:
+
+#U-Shaped Trend: Ideally, you want to see a U-shaped trend where dispersion is higher at low counts, decreases, and then stabilizes at higher counts. This indicates that the variability in your data is behaving as expected.
+#Smooth Trend Line: The trend line should be smooth without large, erratic jumps. This smoothness indicates that the model is fitting well to the data.
+#Interpretation of Points:
+  
+ # Each dot represents a gene.
+#Genes with low CPM but high BCV are more variable and less reliable for differential expression analysis.
+#Genes with high CPM and low BCV are more consistent and reliable.
+
+```
+
+```{r}
+# Let's check that our normalization worked by plotting the log2(CPM) PCA
+CPM <- cpm(DGE, normalized.lib.sizes = TRUE, log = TRUE)
+CPM <- as.data.frame(CPM)
+```
+
+```{r}
+# PCA CPM Log2
+pca <- prcomp(t(CPM), scale.=TRUE)
+percentVar <- pca$sdev^2 / sum(pca$sdev^2) * 100
+
+pca_df <- as.data.frame(pca$x)
+pca_df$group <- DGE$samples$group
+
+ggplot(pca_df, aes(PC1, PC2, color=treatment)) +
+  geom_point(size=4) +
+  theme_minimal() +
+  labs(
+    title="PCA of RNA-seq Data",
+    x=paste0("PC1: ", round(percentVar[1], 2), "% variance"),
+    y=paste0("PC2: ", round(percentVar[2], 2), "% variance")
+  ) +
+  scale_color_manual(values=c("PBS injection"="black", "alpha-KG injection"="lightsteelblue2"))
+```
+
+```{r}
+# Visualize normalized data
+boxplot(CPM, las = 2, ylab = "log2 CPM", main = "Normalized Data", col="lightsteelblue2")
+```
+
+```{r}
+# Now for the main point of this session, differential gene expression!
+
+# We first should consider what specific comparisons we would like to make
+# What's our research question and what would I like to know?
+
+# We can make a contrast matrix to specify specific comparisons of interest
+# Condition1 - Condition2 will result in the log2FC in Condition1 using 
+# Condition2 as a reference
+# If there are only two factor levels and the reference level doesn't appear
+# in our design matrix, we only need to specify the name of the level
+# Add as many specific comparisons as you would like
+# Create the design matrix with valid column names
+colnames(design) <- make.names(colnames(design))
+print(colnames(design))
+
+contrast.matrix <- makeContrasts(KG_vs_Unt = treatmentalpha.KG.injection - treatmentPBS.injection, 
+                                 levels = design)
+```
+
+# lrt Test 
+```{r, include=FALSE}
+# GLM likelihood ratio test for identifying DE genes
+
+# glmFit and glmLRT use generalized linear model (GLM) methods
+# The Likelihood ratio test (LRT) is based on the idea of fitting negative
+# binomial GLMs with the Cox-Reid dispersion estimates, which will take all known
+# sources of variation into account. 
+
+# Because of this, the GLM likelihood 
+# ratio test is recommended for experiments with multiple factors.
+
+# Fit a gene-wise negative binomial generalized linear model
+fit <- glmFit(DGE, design, contrast = contrast.matrix)
+fit_df <- as.data.frame(fit)
+
+# CHANGE AS NEEDED
+# When running the glmLRT function, 
+# be careful to use the correct name to specify the comparison of interest! 
+# Here, we are primarily interested in the "KG vs Untreated" comparison
+lrt <- glmLRT(fit, contrast = contrast.matrix[,"KG_vs_Unt"]) 
+topTags(lrt)
+write.csv(lrt, file = "lrt.csv", row.names = TRUE)
+```
+
+```{r}
+# Sanity check
+topTags(lrt)
+```
+
+
+# Final Results (From lrt)
+```{r}
+# Here are the prelim results! You get a table that has your genes, the logFC, 
+# logCPM, LR (likelihood ratio test statistics), p-value, and FDR-adjusted p-value
+
+# Now see how many genes are either up- or down-regulated w/ treatment
+de <- decideTests(lrt, adjust.method = "fdr")
+summary(de)
+
+# Save your results
+Results <- as.data.frame(topTags(lrt, n = dim(DGE)[1]))
+
+# Merge with annotations
+Annot <- read.csv("AnnotTable.csv",
+                  header = TRUE)
+
+# Merge your added annotation information with your results
+Results <- merge(Annot, Results, by.x = "ENSEMBL", by.y = "genes")
+
+# Save your results in a .csv file that you can open with excel
+write.csv(Results, file = "log2FC_KG_vs_PBS.csv", row.names = FALSE)
+```
+
+```{r}
+# CHANGE AS NEEDED
+# Significance thresholds
+
+# But how many of those are actually significant?
+# Save the ones with p-value < 0.05 and log2FC > 1
+# You can change these values to be whatever threshold you'd like
+# Using the unadj. p-value and FC can produce more reproducible results than 
+# using FDR alone!
+DE <- Results[Results$PValue < 0.05 & abs(Results$logFC) > 0.3, ]
+DE_sig <- Results[Results$PValue < 0.05, ]
+
+# Top 20 differentially expressed up-regulated genes
+head(DE, 20)
+```
+
+```{r, include=FALSE}
+# Save those gene names as "detags"
+detags <- DE$ENSEMBL
+detags2 <- DE$SYMBOL
+```
+
+```{r}
+# Make a volcano plot
+volcano <- plot(-log10(Results$PValue) ~ Results$logFC, 
+     xlab = "log2 fold change", ylab = "-log10 p-value", 
+     main = "DE Genes with Treatment", xlim = c(-10, 10))
+points(-log10(Results$PValue[Results$ENSEMBL %in% detags2]) ~ 
+         Results$logFC[Results$ENSEMBL %in% detags2], 
+       col = "grey", pch = 16)
+abline(v = c(-1, 1), col = "lightsteelblue2")
+legend("topleft", legend = "DE genes (FC > 2, p < 0.05)", pch = 16, 
+       col = "grey", bty = "n")
+
+# Want to label the symbols of some genes of interest?
+# Let's label the top X genes (highest absolute FC)
+Results_arranged <- arrange(Results, PValue)
+top4_Results <- Results_arranged[1:20, ]
+text(-log10(top4_Results$PValue) ~ top4_Results$logFC, 
+     labels = top4_Results$SYMBOL, cex = 0.9, font = 2)
+```
+
+```{r}
+# Heatmap
+
+# Next, lets define our colors so we can visualize clustering
+# You need a character vector to represent each sample's annotation color
+# This vector must be in the same order + have the same # columns as your 
+# heatmap data!
+Colors <- as.vector(colnames(CPM))
+Colors[grepl("PBS injection", Colors)] <- "Blue"
+Colors[grepl("alpha-KG injection", Colors)] <- "Red"
+
+head(Colors)
+
+heatmap.2(as.matrix(CPM[rownames(CPM) %in% detags, ]), 
+          scale = "row", trace = "none", labRow = FALSE, srtCol=45,
+          margins = c(8, 6), ColSideColors = Colors)
+# ColSideColors is what adds the annotation
+```
+
+# Genes of Interest
+```{r, warning=FALSE}
+# Assume lrt_results is your LRT results object
+# Convert lrt results to data frame
+lrt_df <- as.data.frame(Results)
+
+# Example genes of interest (replace with your actual genes)
+genes_of_interest <- c("Erbb4", "Erbb2", "Nrg1", "Acvrl1", "Ccn2", "Sost", "Igfbp3", "Islr", "Gdf2")
+
+# Filter results for these genes
+filtered_lrt_df <- lrt_df[lrt_df$SYMBOL %in% genes_of_interest, ]
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "LogFC for Genes of Interest") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12)
+  )
+```
+
+```{r}
+# Add a new column for formatted p-values
+filtered_lrt_df$pval_label <- paste0("P = ", signif(filtered_lrt_df$PValue, 3))
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  geom_text(aes(label = pval_label), vjust = -0.5, size = 4, color = "black") + # Add p-values above the bars
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "LogFC for Genes of Interest") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12)
+  )
+
+```
+
+
+# GSEA and GO
+```{r}
+# This module needs an object from the edgeR module
+# Import gene expression table - from the EdgeR module
+edgeRdata <- read.csv("log2FC_KG_vs_PBS.csv")
+head(edgeRdata)
+```
+
+```{r}
+# Identify up-regulated differentially expressed (DE) genes (FDR < 0.05) 
+SigGenes <- edgeRdata[which(edgeRdata$FDR<0.05 & edgeRdata$logFC>0),"ENSEMBL"]
+length(SigGenes) #1032 DE genes 
+```
+
+```{r}
+# down-regulated
+SigGenesdown <- edgeRdata[which(edgeRdata$FDR<0.05 & edgeRdata$logFC<0),"ENSEMBL"]
+length(SigGenesdown) #1032 DE genes 
+```
+
+```{r}
+# all genes detected
+ExpGenes<-edgeRdata$ENSEMBL
+
+# the Venn diagram helps you to visualize the number and construct the contingency table
+venn(list("Up regulated"=SigGenes,
+          "Down Regulated"=SigGenesdown,
+          "Expressed"=ExpGenes))
+```
+
+```{r, include=FALSE}
+# Now, it's time to use the lrt object from edgeR analysis
+# write.csv(lrt, file = "lrt.csv", row.names = FALSE)
+str(lrt)
+lrt$genes
+
+## Only ENSEMBL gene annotation is stored in the lrt object, 
+## or lrt$genes, more precisely.
+## However, GO terms are defined by 
+## National Human Genome Research Institute, an american institute.
+## Hence GO terms use ENTREZID to annotate the database, 
+## and we need to add ENTREZID annotation into lrt object.
+
+str(Annot)
+head(Annot)
+lrt$genes<-Annot[match(lrt$genes$genes,Annot$ENSEMBL),]
+head(lrt$genes)
+```
+
+# Goana
+```{r, include=FALSE}
+# Goana (mouse)
+GoanaResults<-goana(lrt,
+                    geneid=lrt$genes$ENTREZID,
+                    species="Mm",
+                    FDR = .05)
+
+# The argument lrt is a fitted model object created by glmLRT() function. we did this in edgeR module!!
+# The implement is not smart enough to detect and choose Entrez IDs, 
+# which are used in GO database, so specify it in the second argument.
+
+str(GoanaResults)
+head(GoanaResults)
+
+# let's adjust the p-values with FDR method for multiple testing
+# Benjamini & Hochberg (1995) ("BH" or its alias "fdr")
+
+GoanaResults$FDR.Up<-p.adjust(GoanaResults$P.Up, method = "fdr")
+GoanaResults$FDR.Down<-p.adjust(GoanaResults$P.Down, method = "fdr")
+```
+
+```{r}
+# Top significant results
+head(GoanaResults, 10)
+```
+
+
+```{r, include=FALSE}
+# How many up-regulated biological processes?
+dim(GoanaResults[which(GoanaResults$P.Up<.05 & GoanaResults$Ont=="BP"),])   #2688
+dim(GoanaResults[which(GoanaResults$FDR.Up<.05 & GoanaResults$Ont=="BP"),]) #1515
+
+# How many up-regulated and enriched GO terms
+dim(GoanaResults[which(GoanaResults$FDR.Up<.05),])
+```
+
+```{r, include=FALSE}
+# Unrapping GoanaResult 
+# Top enriched GO terms in up-regulated genes 
+# There is a topGO() function to identify top enriched GO Terms.
+# However, topGO() is not flexible enough to identify GO term of interest
+# let's just use the great old friend - [ ] - to select what we want
+
+# The top20 GO terms that are enriched in the up-regulated genes.
+# i.e. The top 20 up-regulated GO terms
+GoanaResults[order(GoanaResults$FDR.Up)[1:20],] 
+View(GoanaResults[order(GoanaResults$FDR.Up)[1:20],] )
+
+# The top 20 GO terms are too general terms (n>4,000)
+# How many genes in each GO terms
+
+hist(GoanaResults$N)
+hist(GoanaResults$N[GoanaResults$N<1000]) # narrow down to show the histogram with N<1000
+
+# let's select those terms with fewer than 200 genes involved.
+# this can help us identify GO terms with more specific annotation 
+
+GoanaResultsBP.SU <- GoanaResults[GoanaResults$Ont == "BP" & GoanaResults$N < 200 & 
+                                    GoanaResults$FDR.Up < .05, ]
+
+Goana_Results_top10_BP_less200 <- GoanaResultsBP.SU[order(GoanaResultsBP.SU$FDR.Up)[1:10], ] #now, it makes more sense
+write.csv(Goana_Results_top10_BP_less200, file = "Goana_Results_Filtered.csv", row.names = TRUE)
+```
+
+```{r}
+# Less than 200 genes in enrichment result!
+head(Goana_Results_top10_BP_less200,10)
+```
+
+
+```{r, include=FALSE}
+# practice more subset techniques 
+
+# select rows with a specific FDR range
+# barely significant GO terms
+GoanaResults[which(GoanaResults$FDR.Up<0.05 & GoanaResults$FDR.Up>0.049),]
+
+# a piece of cake to identify specific GO IDs e.g. GO:0050868
+#GoanaResults[which(row.names(GoanaResults)=="GO:0050868"),]
+
+#How many down-regulated biological processes?
+dim(GoanaResults[which(GoanaResults$P.Down<.05 & GoanaResults$Ont=="BP"),])
+downregBP<-GoanaResults[order(GoanaResults$P.Down)[1:12],]
+
+#Nothing really interesting with FDR.Down in 3 different GO term categories 
+dim(GoanaResults[which(GoanaResults$FDR.Down<.05 & GoanaResults$Ont=="BP"),])
+dim(GoanaResults[which(GoanaResults$FDR.Down<.05 & GoanaResults$Ont=="MF"),])
+GoanaResults[which(GoanaResults$FDR.Down<.05 & GoanaResults$Ont=="MF"),]
+
+dim(GoanaResults[which(GoanaResults$FDR.Down<.05 & GoanaResults$Ont=="CC"),])
+```
+
+# GSEA
+```{r, warning=FALSE, include=FALSE}
+# Create an numeric vector with gene IDs for GSEA analysis as input
+input<-Results$logFC
+names(input)<-as.character(Results$ENTREZID) # the package only accept ENTREZID
+unique.input<-input[-c(which(duplicated(names(input))==TRUE))] #remove duplicated IDs 
+unique.input<-sort(unique.input,decreasing = TRUE) #sort the numeric vector
+
+str(unique.input)
+head(unique.input)
+tail(unique.input)
+
+# using gsego() function to perform GSEA analysis using GO database
+
+GSEA_GO <- gseGO(geneList  = unique.input,
+                 OrgDb        = org.Mm.eg.db,
+                 ont          = "BP", # "CC", "MF","BP"
+                 minGSSize    = 100, #how big the go term genes in list
+                 maxGSSize    = 500,
+                 pvalueCutoff = 0.05,
+                 verbose      = FALSE)
+
+head(GSEA_GO)
+GSEA_GO_df <- as.data.frame(GSEA_GO)
+```
+
+```{r}
+# GSEA Results
+head(GSEA_GO_df,10)
+```
+
+
+```{r}
+# Assuming GSEA_GO is your GSEA result object
+# Filter for the top 10 results by NES (normalized enrichment score) or p-value
+top10_results <- GSEA_GO@result %>% 
+  dplyr::arrange(desc(NES)) %>% 
+  dplyr::slice(1:10)
+
+top10_results
+
+# Create a dot plot of the top 10 GSEA results
+ggplot(top10_results, aes(x = reorder(Description, NES), y = NES, color = p.adjust)) +
+  geom_point(size = 4) +
+  coord_flip() +
+  labs(x = "GO Terms", y = "Normalized Enrichment Score (NES)", title = "Top 10 GSEA Results") +
+  scale_color_gradient(low = "blue", high = "red") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12)
+  )
+```
+
+```{r, echo=FALSE}
+# Bar plot for the top 10 GO terms
+ggplot(top10_results, aes(x = reorder(Description, NES), y = NES, fill = p.adjust)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(x = "GO Terms", y = "Normalized Enrichment Score (NES)", title = "Top 10 GSEA Results (Bar Plot)") +
+  scale_fill_gradient(low = "blue", high = "red") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12)
+  )
+```
+
+```{r}
+# GSEA plot
+gseaplot2(GSEA_GO,geneSetID = "GO:0016055", pvalue_table = TRUE)
+gseaplot2(GSEA_GO,geneSetID = "GO:0003007", pvalue_table = TRUE)
+gseaplot2(GSEA_GO,geneSetID = "GO:0019827", pvalue_table = TRUE) 
+```
+
+
+```{r, warning=FALSE, include=FALSE}
+# ClusterProfiler
+expr <- Results
+
+# Filter unregulated (> 1.1), downregulated ( < 0.7), (,1 takes ID's from column 1)
+up.genes <- expr[expr$logFC > 0.2 & expr$FDR < 0.05, 1] 
+dn.genes <- expr[expr$logFC < -0.2 & expr$FDR < 0.05, 1]
+bkgd.genes <- expr[,1]
+
+# switch ID's to entrez ID (bitr is the converter) 
+up.genes.entrez <- clusterProfiler::bitr(up.genes,fromType = "ENSEMBL",toType = "ENTREZID",OrgDb = org.Mm.eg.db)
+dn.genes.entrez <- bitr(dn.genes,fromType = "ENSEMBL",toType = "ENTREZID",OrgDb = org.Mm.eg.db)
+bkgd.genes.entrez <- bitr(bkgd.genes,fromType = "ENSEMBL",toType = "ENTREZID",OrgDb = org.Mm.eg.db)
+```
+
+```{r}
+# BIOLOGICAL PROCESS ONLY
+# website of code https://rdrr.io/bioc/rWikiPathways/f/vignettes/Pathway-Analysis.Rmd
+# Up-regulated only BP
+egobp_up <- clusterProfiler::enrichGO(
+        gene     = up.genes.entrez[[2]],
+        universe = bkgd.genes.entrez[[2]],
+        OrgDb    = org.Mm.eg.db,
+        ont      = "BP",
+        pAdjustMethod = "fdr",
+        pvalueCutoff = 0.05, 
+        readable = TRUE)
+
+# Make results a data frame and save to CSV
+BP_enrichment_results_upreg <- as.data.frame(egobp_up)
+# write.csv(BP_enrichment_results_upreg, "BP_enrichment_results_upreg.csv")
+head(BP_enrichment_results_upreg,10)
+```
+
+```{r}
+# Plot 1:20 all terms
+go_terms_all_upreg <- ggplot(egobp_up[1:20], aes(x=reorder(Description, -pvalue), y=Count, fill=-p.adjust)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_continuous(low="#b3b3b3", high="lightsteelblue2") +
+    labs(x = "", y = "", fill = "p.adjust") +
+    theme(axis.text=element_text(size=11),
+          colour = "black") +
+    theme_minimal() +
+    ggtitle(label = "Up-regulated",
+            subtitle = "Biological Process") +
+    ylab("Hit Proteins") +
+    theme(axis.text.y=element_text(colour = "black")) 
+
+go_terms_all_upreg
+```
+
+```{r}
+# Filter the enrichment results for the GO term "proliferation"
+go_term_data_proliferation <- BP_enrichment_results_upreg[grep("proliferation", BP_enrichment_results_upreg$Description, ignore.case = TRUE), ]
+
+# Extract the gene list associated with this GO term
+if (nrow(go_term_data_proliferation) > 0) {
+    gene_list_proliferation <- strsplit(go_term_data_proliferation$geneID, "/")[[1]]
+
+    # View the gene list
+    print(gene_list_proliferation)
+
+    # Save the gene list to a CSV file
+    write.csv(gene_list_proliferation, "proliferation_gene_list.csv", row.names = FALSE)
+} else {
+    print("No GO term related to proliferation found in the results.")
+}
+
+```
+
+```{r}
+# Genes from GO-terms of interest (proliferation)
+
+# Filter results for these genes
+filtered_lrt_df_proliferation <- lrt_df[lrt_df$SYMBOL %in% gene_list_proliferation[1:20], ]
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df_proliferation, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "Proliferation Terms") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1) 
+  )
+```
+
+```{r}
+# Filter the enrichment results for the GO term "proliferation"
+go_term_data_ki67 <- BP_enrichment_results_upreg[grep("Mki67", BP_enrichment_results_upreg$geneID, ignore.case = TRUE), ]
+
+# Extract the gene list associated with this GO term
+if (nrow(go_term_data_ki67) > 0) {
+    gene_list_ki67 <- strsplit(go_term_data_ki67$geneID, "/")[[1]]
+
+    # View the gene list
+    print(gene_list_ki67)
+
+    # Save the gene list to a CSV file
+    write.csv(gene_list_ki67, "ki67_gene_list.csv", row.names = FALSE)
+} else {
+    print("No GO term related to Mki67 found in the results.")
+}
+
+# head(go_term_data_ki67,12)
+
+pander(head(go_term_data_ki67, 12), caption = "Top 12 Rows of go_term_data_ki67")
+```
+
+```{r, include=FALSE}
+# Genes from GO-terms of interest (Mki67)
+# Find the index of "Mki67" in the vector
+index_mki67 <- which(gene_list_ki67 == "Mki67")
+
+# Select "Mki67" using its index
+selected_gene <- gene_list_ki67[index_mki67]
+
+# Create a new list with the selected gene
+new_list <- list(selected_gene)
+
+
+# Filter results for these genes
+filtered_lrt_df_ki67 <- lrt_df[lrt_df$SYMBOL %in% new_list, ]
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df_ki67, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "Mki67") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1) 
+  )
+```
+
+```{r}
+# Add a control column with all values set to 1
+filtered_lrt_df_ki67 <- filtered_lrt_df_ki67 %>%
+  mutate(PBS = 1)
+
+# Assuming you have a data frame named filtered_lrt_df_ki67 with a column logFC
+filtered_lrt_df_ki67 <- filtered_lrt_df_ki67 %>%
+  mutate(FC = 2^logFC)  # Convert logFC to FC
+
+# Create significance indicator
+filtered_lrt_df_ki67 <- filtered_lrt_df_ki67 %>%
+  mutate(significant = ifelse(PValue < 0.05, "Significant", "Not Significant"))
+
+# Rename the logFC column
+filtered_lrt_df_ki67_alpha <- filtered_lrt_df_ki67 %>%
+  rename(`a-KG` = FC)
+
+# Reshape data for ggplot2
+df_long <- filtered_lrt_df_ki67_alpha %>%
+  pivot_longer(cols = c(`a-KG`, PBS), names_to = "Type", values_to = "Value")
+
+# Create the plot with adjusted spacing
+ggplot(df_long, aes(x = SYMBOL, y = Value, fill = Type)) +
+  geom_bar(stat = "identity", position = position_dodge(width = 0.8), width = 0.7) +  # Adjust width here
+  scale_fill_manual(values = c("a-KG" = "lightsteelblue2", "PBS" = "gray70")) +  # Customize colors
+  labs(x = "Gene", y = "Normalized Value", title = "Fold Change with Control Reference") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 12),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+
+```
+
+```{r}
+head(df_long$PValue, 1)
+```
+
+```{r}
+# Filter the enrichment results for the GO term "angiogenesis"
+go_term_data <- BP_enrichment_results_upreg[grep("angiogenesis", BP_enrichment_results_upreg$Description, ignore.case = TRUE), ]
+
+# Extract the gene list associated with this GO term
+if (nrow(go_term_data) > 0) {
+    gene_list <- strsplit(go_term_data$geneID, "/")[[1]]
+
+    # View the gene list
+    print(gene_list)
+
+    # Save the gene list to a CSV file
+    write.csv(gene_list, "angiogenesis_gene_list.csv", row.names = FALSE)
+} else {
+    print("No GO term related to angiogenesis found in the results.")
+}
+
+```
+
+```{r}
+# Wnt signaling pathway
+go_term_data_wnt <- BP_enrichment_results_upreg[grep("Wnt", BP_enrichment_results_upreg$Description, ignore.case = TRUE), ]
+
+# Extract the gene list associated with this GO term
+if (nrow(go_term_data_wnt) > 0) {
+    gene_list_wnt <- strsplit(go_term_data_wnt$geneID, "/")[[1]]
+
+    # View the gene list
+    print(gene_list_wnt)
+
+    # Save the gene list to a CSV file
+    write.csv(gene_list_wnt, "wnt_gene_list.csv", row.names = FALSE)
+} else {
+    print("No GO term related to angiogenesis found in the results.")
+}
+```
+
+```{r}
+# BMP signaling pathway
+go_term_data_bmp <- BP_enrichment_results_upreg[grep("Bmp", BP_enrichment_results_upreg$Description, ignore.case = TRUE), ]
+
+# Extract the gene list associated with this GO term
+if (nrow(go_term_data_bmp) > 0) {
+    gene_list_bmp <- strsplit(go_term_data_bmp$geneID, "/")[[1]]
+
+    # View the gene list
+    print(gene_list_bmp)
+
+    # Save the gene list to a CSV file
+    write.csv(gene_list_bmp, "bmp_gene_list.csv", row.names = FALSE)
+} else {
+    print("No GO term related to angiogenesis found in the results.")
+}
+```
+
+```{r}
+# Genes from GO-terms of interest (bmp)
+
+# Filter results for these genes
+filtered_lrt_df_bmp <- lrt_df[lrt_df$SYMBOL %in% gene_list_bmp[1:44], ]
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df_bmp, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "Bmp Terms") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 8),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r}
+# Genes from GO-terms of interest (wnt)
+
+# Filter results for these genes
+filtered_lrt_df_wnt <- lrt_df[lrt_df$SYMBOL %in% gene_list_wnt[1:20], ]
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df_wnt, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "Wnt Terms") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r}
+# Genes from GO-terms of interest (angiogenesis)
+
+# Filter results for these genes
+filtered_lrt_df_angio <- lrt_df[lrt_df$SYMBOL %in% gene_list[1:20], ]
+
+# Plot logFC values with bars for reference and treatment
+ggplot(filtered_lrt_df_angio, aes(x = SYMBOL, y = logFC)) +
+  geom_bar(stat = "identity", position = "dodge", fill = "lightsteelblue2") +  # Dodge position to place bars side by side
+  labs(x = "Gene", y = "Log Fold Change (logFC)", title = "Angiogenesis Terms") +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    axis.title.x = element_text(face = "italic"),
+    axis.title.y = element_text(face = "italic"),
+    axis.text = element_text(size = 10),
+    axis.text.x = element_text(angle = 45, hjust = 1)
+  )
+```
+
+```{r}
+# BIOLOGICAL PROCESS ONLY
+#Down-regulated only BP
+egobp_down <- clusterProfiler::enrichGO(
+        gene     = dn.genes.entrez[[2]],
+        universe = bkgd.genes.entrez[[2]],
+        OrgDb    = org.Mm.eg.db,
+        ont      = "BP",
+        pAdjustMethod = "fdr",
+        pvalueCutoff = 0.05, 
+        readable = TRUE)
+
+BP_enrichment_results_downreg <- as.data.frame(egobp_down)
+head(BP_enrichment_results_downreg, 10)
+```
+
+```{r}
+# Plot 1:20 all terms
+go_terms_all_downreg <- ggplot(egobp_down[1:20], aes(x=reorder(Description, -pvalue), y=Count, fill=-p.adjust)) +
+    geom_bar(stat = "identity") +
+    coord_flip() +
+    scale_fill_continuous(low="#b3b3b3", high="lightsteelblue2") +
+    labs(x = "", y = "", fill = "p.adjust") +
+    theme(axis.text=element_text(size=11),
+          colour = "black") +
+    theme_minimal() +
+    ggtitle(label = "Down-regulated",
+            subtitle = "Biological Process") +
+    ylab("Hit Proteins") +
+    theme(axis.text.y=element_text(colour = "black")) 
+
+go_terms_all_downreg
+```
+
+# Designed Heat Maps
+
+```{r}
+# Merge your added annotation information with CPM as well for heat map
+# Convert row names to a column and make unique
+colnames(CPM) <- make.names(colnames(CPM), unique = TRUE)
+
+CPM_rownames <- CPM %>%
+ tibble::as_tibble(rownames = "ENSEMBL")
+
+Results_CPM <- merge(Annot, CPM_rownames, by.x = "ENSEMBL", by.y = "ENSEMBL")
+```
+
+```{r}
+# Data frame list
+gene_list_df <- as.data.frame(gene_list)
+
+# Filter CPM data to keep only rows with symbols in gene_list
+filtered_cpm <- Results_CPM[Results_CPM$SYMBOL %in% gene_list_df$gene_list[1:20], ]
+
+# Remove columns 1, 2, 4, and 5
+filtered_cpm <- filtered_cpm %>%
+  select(-c(1, 2, 4, 5))
+
+# filtered_cpm <- filtered_cpm %>%
+  # rownames_to_column() %>%
+  # column_to_rownames(var = "SYMBOL")
+
+#filtered_cpm <- filtered_cpm %>%
+ # select(-c(1))
+
+# Convert to matrix
+# filtered_cpm_heatmap_data <- as.matrix(filtered_cpm)
+
+# Pivot the data frame from wide to long format
+df_long <- filtered_cpm %>%
+  pivot_longer(
+    cols = starts_with("PBS") | starts_with("alpha.KG"),  # Select columns to pivot
+    names_to = "Condition",  # New column for the variable names
+    values_to = "Count"      # New column for the values
+  )
+
+# Create the heatmap with a three-color gradient
+ggplot(df_long, aes(x = Condition, y = SYMBOL, fill = Count)) +
+  geom_tile() +  # Create tiles for the heatmap
+  scale_fill_gradientn(
+    colors = c("blue", "white", "red")  # Define the three-color gradient
+  ) +
+  theme_minimal() +  # Clean theme
+  labs(title = "Heatmap of Angiogenesis Gene Counts by Condition", x = "Condition", y = "Gene Symbol", fill = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+
+```
+
+```{r}
+# # Data frame list
+gene_list_df <- as.data.frame(genes_of_interest)
+
+# Filter CPM data to keep only rows with symbols in gene_list
+filtered_cpm <- Results_CPM[Results_CPM$SYMBOL %in% gene_list_df$genes_of_interest[1:8], ]
+
+# Remove columns 1, 2, 4, and 5
+filtered_cpm <- filtered_cpm %>%
+  select(-c(1, 2, 4, 5))
+
+# Pivot the data frame from wide to long format
+df_long <- filtered_cpm %>%
+  pivot_longer(
+    cols = starts_with("PBS") | starts_with("alpha.KG"),  # Select columns to pivot
+    names_to = "Condition",  # New column for the variable names
+    values_to = "Count"      # New column for the values
+  )
+
+# Create the heatmap with a three-color gradient
+ggplot(df_long, aes(x = Condition, y = SYMBOL, fill = Count)) +
+  geom_tile() +  # Create tiles for the heatmap
+  scale_fill_gradientn(
+    colors = c("blue", "white", "red")  # Define the three-color gradient
+  ) +
+  theme_minimal() +  # Clean theme
+  labs(title = "Heatmap of Interesting Gene Counts by Condition", x = "Condition", y = "Gene Symbol", fill = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```
+
+
+```{r}
+# Package versions
+sessionInfo()
+```
+
